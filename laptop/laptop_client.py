@@ -6,8 +6,8 @@ Usage:
     python laptop_client.py              # auto-scan and connect
     python laptop_client.py AA:BB:CC:..  # connect directly by MAC address
 
-Gestures and proximity thresholds live in gestures.py.
-This file handles BLE connection, RSSI monitoring, and reconnection only.
+Gestures, zones, and distance calibration live in gestures.py.
+This file handles BLE connection, RSSI smoothing, and reconnection only.
 """
 
 import asyncio
@@ -16,17 +16,17 @@ import sys
 
 from bleak import BleakClient, BleakScanner
 
-from gestures import GESTURE_MAP, proximity_zone
+from gestures import GESTURE_MAP, proximity_info
 
 # ── BLE identifiers — must match firmware ─────────────────────────────────────
-DEVICE_NAME   = "M5GestureWand"
-SERVICE_UUID  = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-GESTURE_UUID  = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+DEVICE_NAME  = "M5GestureWand"
+SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+GESTURE_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-# ── RSSI scan interval ────────────────────────────────────────────────────────
-# How often to re-scan for the device to update proximity.
-# Lower = more responsive proximity, but more radio traffic.
-RSSI_SCAN_INTERVAL = 8.0  # seconds
+# ── RSSI smoothing — exponential moving average ───────────────────────────────
+# Alpha 0.0 = frozen, 1.0 = raw (no smoothing). 0.25 is snappy but stable.
+RSSI_EMA_ALPHA    = 0.25
+RSSI_SCAN_INTERVAL = 4.0   # seconds between proximity scans
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -36,16 +36,23 @@ logging.basicConfig(
 )
 log = logging.getLogger("gesturewand")
 
-# ── Shared state ──────────────────────────────────────────────────────────────
-_rssi = -60  # initialise to NEAR so gestures work before first RSSI scan
+# ── Shared RSSI state ─────────────────────────────────────────────────────────
+_rssi_smooth: float = -60.0   # EMA-smoothed RSSI; starts optimistic (NEAR)
 
-# ── Gesture notification callback ────────────────────────────────────────────
+def _update_rssi(raw: int) -> None:
+    global _rssi_smooth
+    _rssi_smooth = RSSI_EMA_ALPHA * raw + (1 - RSSI_EMA_ALPHA) * _rssi_smooth
+
+def _current_prox():
+    return proximity_info(int(round(_rssi_smooth)))
+
+# ── Gesture notification callback ─────────────────────────────────────────────
 def _on_gesture(sender, data: bytearray):
     gesture = data.decode(errors="replace").strip()
-    zone    = proximity_zone(_rssi)
+    prox    = _current_prox()
 
-    if zone == "FAR":
-        log.debug("Suppressed %-16s (FAR,  RSSI %d dBm)", gesture, _rssi)
+    if prox.zone == "OUT_OF_RANGE":
+        log.debug("Suppressed %-16s  (~%.1f m, OUT_OF_RANGE)", gesture, prox.distance_m)
         return
 
     handler = GESTURE_MAP.get(gesture)
@@ -55,47 +62,54 @@ def _on_gesture(sender, data: bytearray):
         log.warning("Unknown gesture %r — add it to GESTURE_MAP in gestures.py", gesture)
         return
 
-    log.info("%-16s  zone=%-6s  RSSI=%d dBm", gesture, zone, _rssi)
+    log.info("%-16s  zone=%-11s  ~%4.1f m  RSSI=%d dBm",
+             gesture, prox.zone, prox.distance_m, prox.rssi)
     try:
-        handler(zone)
+        handler(prox)
     except Exception as exc:
         log.error("Handler for %r raised: %s", gesture, exc)
 
 # ── Background RSSI monitor ───────────────────────────────────────────────────
 async def _rssi_monitor(address: str):
-    """Periodically scan for the device to update _rssi for proximity gating."""
-    global _rssi
+    """Scan every RSSI_SCAN_INTERVAL seconds and EMA-smooth the result."""
     while True:
         await asyncio.sleep(RSSI_SCAN_INTERVAL)
         try:
             found = await BleakScanner.discover(timeout=3.0, return_adv=True)
             for device, adv in found.values():
-                if device.address.upper() == address.upper():
-                    if adv.rssi is not None:
-                        _rssi = adv.rssi
-                    log.debug("RSSI %d dBm → zone=%s", _rssi, proximity_zone(_rssi))
+                if device.address.upper() == address.upper() and adv.rssi is not None:
+                    _update_rssi(adv.rssi)
+                    prox = _current_prox()
+                    log.debug("RSSI raw=%d  smooth=%d  zone=%-11s  ~%.1f m",
+                              adv.rssi, int(_rssi_smooth), prox.zone, prox.distance_m)
                     break
         except Exception as exc:
             log.debug("RSSI scan error: %s", exc)
 
 # ── Device discovery ──────────────────────────────────────────────────────────
-async def _find_device() -> str:
+async def _find_device() -> tuple[str, int]:
     log.info("Scanning for '%s'...", DEVICE_NAME)
     while True:
         found = await BleakScanner.discover(timeout=10.0, return_adv=True)
         for device, adv in found.values():
             if device.name == DEVICE_NAME:
                 rssi = adv.rssi if adv.rssi is not None else -99
-                log.info("Found %s  address=%s  RSSI=%d dBm", device.name, device.address, rssi)
-                return device.address
+                prox = proximity_info(rssi)
+                log.info("Found %s  address=%s  ~%.1f m  zone=%s  RSSI=%d dBm",
+                         device.name, device.address,
+                         prox.distance_m, prox.zone, rssi)
+                return device.address, rssi
         log.info("Not found — retrying scan...")
 
 # ── Main connection loop ──────────────────────────────────────────────────────
 async def run(address: str | None = None):
-    if address is None:
-        address = await _find_device()
+    global _rssi_smooth
 
-    log.info("Connecting to %s", address)
+    if address is None:
+        address, first_rssi = await _find_device()
+        _rssi_smooth = float(first_rssi)   # seed EMA with real first reading
+    else:
+        log.info("Connecting to %s", address)
 
     while True:
         try:
