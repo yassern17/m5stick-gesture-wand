@@ -1,0 +1,6 @@
+laptop/.venv/
+laptop/__pycache__/
+*.pyc
+bin/
+firmware/**/build/
+.claude/
