@@ -23,6 +23,7 @@ class BLEBridge:
         self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         self._client: Optional[BleakClient] = None
         self._connected = False
+        self._stopped = False
         self._event_queue: queue.Queue[str] = queue.Queue()
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="ble-bridge"
@@ -32,6 +33,19 @@ class BLEBridge:
 
     def start(self) -> None:
         self._thread.start()
+
+    def stop(self) -> None:
+        """Disconnect and stop the background loop."""
+        self._stopped = True
+        if self._client and self._connected:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._client.disconnect(), self._loop)
+            try:
+                fut.result(timeout=3.0)
+            except Exception:
+                pass
+        self._connected = False
+        self._client = None
 
     @property
     def connected(self) -> bool:
@@ -88,7 +102,7 @@ class BLEBridge:
         self._loop.run_until_complete(self._connect_loop())
 
     async def _connect_loop(self) -> None:
-        while True:
+        while not self._stopped:
             try:
                 device = await BleakScanner.find_device_by_name(
                     DEVICE_NAME, timeout=10.0
@@ -125,5 +139,5 @@ class BLEBridge:
     async def _write(self, data: bytes) -> None:
         if self._client and self._connected:
             await self._client.write_gatt_char(
-                CMD_CHAR_UUID, data, response=False
+                CMD_CHAR_UUID, data, response=True
             )

@@ -1,0 +1,7 @@
+{
+  "BTN_A": {
+    "type": "key",
+    "label": "Volume up",
+    "keys": "XF86AudioRaiseVolume"
+  }
+}

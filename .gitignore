@@ -1,6 +1,37 @@
-laptop/.venv/
-laptop/__pycache__/
+# Python
+.venv/
+__pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Build / generated
 bin/
 firmware/**/build/
+*.o
+*.elf
+*.bin
+*.hex
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
 .claude/
+CLAUDE.md
+
+# Runtime / temp
+*.pid
+*.log
+*.sock
+
+
+# other
+
+ROADMAP.md

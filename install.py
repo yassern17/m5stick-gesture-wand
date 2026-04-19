@@ -56,15 +56,16 @@ ARDUINO_CLI_URLS: dict[tuple[str, str], str] = {
 
 _PURPLE = "\033[1;35m"
 _BLUE   = "\033[1;34m"
+_CYAN   = "\033[1;36m"
 _BOLD   = "\033[1m"
 _GREEN  = "\033[32m"
 _YELLOW = "\033[33m"
 _RED    = "\033[31m"
 _RESET  = "\033[0m"
 
-# Disable colours on Windows cmd
+# Disable colours on Windows cmd (but not Windows Terminal which supports ANSI)
 if _OS == "Windows" and not os.environ.get("WT_SESSION"):
-    _PURPLE = _BLUE = _BOLD = _GREEN = _YELLOW = _RED = _RESET = ""
+    _PURPLE = _BLUE = _CYAN = _BOLD = _GREEN = _YELLOW = _RED = _RESET = ""
 
 def _step(msg: str)  : print(f"\n{_BLUE}==>{_RESET} {_BOLD}{msg}{_RESET}")
 def _ok(msg: str)    : print(f"    {_GREEN}✓{_RESET}  {msg}")
@@ -216,65 +217,144 @@ def register_mcp():
 # ── Step 4: GUI launcher ──────────────────────────────────────────────────────
 
 def create_launcher():
-    _step("GUI launcher")
+    _step("GUI launcher + daemon launcher")
 
     python = str(_venv_python())
 
     if _OS == "Windows":
-        launcher = PROJECT / "run_gui.bat"
-        launcher.write_text(
+        # GUI launcher
+        gui = PROJECT / "run_gui.bat"
+        gui.write_text(
             f'@echo off\n"{python}" -m mcp_server.gui\npause\n',
             encoding="utf-8",
         )
-    else:
-        launcher = PROJECT / "run_gui.sh"
-        launcher.write_text(
-            f'#!/usr/bin/env bash\ncd "{PROJECT}"\nexec "{python}" -m mcp_server.gui\n',
+        _ok(f"Created {gui.name}")
+
+        # Daemon launcher
+        daemon = PROJECT / "run_daemon.bat"
+        daemon.write_text(
+            f'@echo off\necho Starting Claude Watch daemon...\n'
+            f'"{python}" "{PROJECT / "watch_daemon.py"}"\n',
             encoding="utf-8",
         )
-        launcher.chmod(0o755)
+        _ok(f"Created {daemon.name}")
 
-    _ok(f"Created {launcher.name}")
+    else:
+        # GUI launcher — use sg to activate the serial group immediately,
+        # even if the user hasn't logged out since being added to it.
+        gui = PROJECT / "run_gui.sh"
+        gui.write_text(
+            f'#!/usr/bin/env bash\n'
+            f'SERIAL_GROUP=""\n'
+            f'for g in uucp dialout; do\n'
+            f'    getent group "$g" >/dev/null 2>&1 && SERIAL_GROUP="$g" && break\n'
+            f'done\n'
+            f'if [ -n "$SERIAL_GROUP" ]; then\n'
+            f'    exec sg "$SERIAL_GROUP" -c "cd \'{PROJECT}\' && \'{python}\' -m mcp_server.gui"\n'
+            f'else\n'
+            f'    cd "{PROJECT}"\n'
+            f'    exec "{python}" -m mcp_server.gui\n'
+            f'fi\n',
+            encoding="utf-8",
+        )
+        gui.chmod(0o755)
+        _ok(f"Created {gui.name}")
+
+        # Daemon launcher
+        daemon = PROJECT / "run_daemon.sh"
+        daemon.write_text(
+            f'#!/usr/bin/env bash\n'
+            f'echo "Starting Claude Watch daemon (Ctrl+C to stop)"\n'
+            f'cd "{PROJECT}"\n'
+            f'exec "{python}" "{PROJECT / "watch_daemon.py"}"\n',
+            encoding="utf-8",
+        )
+        daemon.chmod(0o755)
+        _ok(f"Created {daemon.name}")
 
 # ── Step 5: Global CLAUDE.md ─────────────────────────────────────────────────
 
 _CLAUDE_MD_BLOCK = """\
-
 ## Claude Watch (M5StickC Plus wrist companion)
 
 A BLE watch is connected via the `claude-watch` MCP server. Use it proactively
-every session without being asked:
+every session without being asked. If `watch_connected()` returns False, skip
+watch calls and continue normally.
 
-- **`set_watch_status(status)`** — call at the start of each task and whenever
-  you switch to a different step (e.g. "Reading files", "Running tests", "Done")
-- **`notify_watch(message)`** — call when a long or background task finishes so
-  the user gets a buzz even if they stepped away
-- **`ask_watch(question)`** — call before any destructive or hard-to-reverse
-  action: deleting files, force-pushing, dropping database tables, bulk edits,
-  anything that affects shared or external state
-- **`get_watch_events()`** — check for pending button presses or gestures before
-  deciding what to do next (BTN_A = proceed, BTN_B = cancel is a common pattern)
+### Always do this
+- **`set_watch_status(status)`** — call at the start of every task and each major
+  step. Up to 38 chars, word-wrapped over 2 lines on the watch.
+- **`get_watch_events()`** — check at every major step for button/gesture input
+  and react before continuing.
 
-If `watch_connected()` returns False, skip the watch calls and continue normally.
+### Notifications & haptics
+- **`notify_watch(message)`** — buzz + flash when a task finishes or needs attention
+- **`buzz_watch(pattern)`** — haptic only: `"done"` (2 short), `"error"` (3 rapid),
+  `"warn"` (1 long). Use instead of notify when display update isn't needed.
+- **`ask_watch(question)`** — yes/no question on the watch (BTN_A=YES, BTN_B=NO);
+  use before any destructive or hard-to-reverse action
+
+### Progress indicator (3+ step tasks)
+- **`set_watch_progress(step, total, label)`** — shows label + filled bar + "2/5"
+  counter on the watch display. Call alongside `set_watch_status()` for sub-step
+  text. Cleared automatically by `notify_watch` or `ask_watch`.
+
+### Watch gesture meanings
+| Event | Action |
+|-------|--------|
+| `BTN_A_LONG` | User wants a status summary — call `notify_watch` with ≤3 words |
+| `SHAKE` / `INTERRUPT` | User wants to stop — pause and ask what to do next |
+| `FLICK_FORWARD` | Proceed / approve / yes |
+| `FLICK_BACK` | Cancel / undo / no |
+| `BATTERY_LOW` | Battery < 15% — call `notify_watch("Battery low!")`, wrap up work |
+
+### Bypass mode (required for watch approval flow)
+Run Claude Code with `--dangerouslySkipPermissions` so it never halts at a
+terminal permission prompt mid-task. Use `ask_watch()` for all approvals instead.
+
+    claude --dangerouslySkipPermissions
+
+### watch_ctl.py (sessions without MCP tools)
+In this project directory:
+
+    .venv/bin/python3 watch_ctl.py status "What I'm doing"
+    .venv/bin/python3 watch_ctl.py notify "Task done"
+    .venv/bin/python3 watch_ctl.py ask "Delete files?"     # → APPROVE/REJECT/timeout
+    .venv/bin/python3 watch_ctl.py buzz done
+    .venv/bin/python3 watch_ctl.py progress 2 5 "Running tests"
 """
+
+_CLAUDE_MD_MARKER = "## Claude Watch"
+
 
 def setup_claude_md():
     _step("Global CLAUDE.md")
+    import re
 
     claude_dir = Path.home() / ".claude"
     claude_dir.mkdir(exist_ok=True)
     claude_md  = claude_dir / "CLAUDE.md"
 
+    new_block = _CLAUDE_MD_BLOCK.strip()
+
     if claude_md.exists():
         existing = claude_md.read_text(encoding="utf-8")
-        if "Claude Watch" in existing:
-            _ok("Claude Watch section already present — skipping")
-            return
-        claude_md.write_text(existing.rstrip() + "\n" + _CLAUDE_MD_BLOCK,
-                             encoding="utf-8")
-        _ok(f"Appended Claude Watch section to existing {claude_md}")
+        if _CLAUDE_MD_MARKER in existing:
+            # Replace existing section (from ## Claude Watch to next ## or EOF)
+            updated = re.sub(
+                r"## Claude Watch.*?(?=\n## |\Z)",
+                new_block,
+                existing,
+                flags=re.DOTALL,
+            ).rstrip() + "\n"
+            claude_md.write_text(updated, encoding="utf-8")
+            _ok(f"Updated Claude Watch section in {claude_md}")
+        else:
+            claude_md.write_text(
+                existing.rstrip() + "\n\n" + new_block + "\n", encoding="utf-8")
+            _ok(f"Appended Claude Watch section to {claude_md}")
     else:
-        claude_md.write_text(_CLAUDE_MD_BLOCK.lstrip(), encoding="utf-8")
+        claude_md.write_text(new_block + "\n", encoding="utf-8")
         _ok(f"Created {claude_md}")
 
 
@@ -392,20 +472,136 @@ def _shortcut_windows():
 def check_ble_permissions():
     if _OS != "Linux":
         return
-    _step("Bluetooth permissions")
+    _step("Bluetooth / serial permissions")
 
     import grp
     user = os.environ.get("USER") or os.environ.get("LOGNAME", "")
+    needs_relogin = False
+
+    # BLE group
     try:
         members = grp.getgrnam("bluetooth").gr_mem
         if user in members:
             _ok(f"'{user}' is already in the bluetooth group")
         else:
-            _warn(f"'{user}' is not in the bluetooth group.")
-            _warn("BLE scanning requires it. Run this, then log out and back in:")
-            print(f"\n        sudo usermod -aG bluetooth {user}\n")
+            _warn(f"'{user}' is not in the bluetooth group — adding…")
+            result = subprocess.run(
+                ["sudo", "usermod", "-aG", "bluetooth", user],
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                _ok("Added to bluetooth group")
+                needs_relogin = True
+            else:
+                _warn("Could not add automatically. Run manually:")
+                print(f"\n        sudo usermod -aG bluetooth {user}\n")
     except KeyError:
         _ok("No 'bluetooth' group (may use 'plugdev' — BLE should work)")
+
+    # Serial port group — dialout (Debian/Ubuntu/Fedora) or uucp (Arch)
+    serial_group = None
+    for g in ("dialout", "uucp"):
+        try:
+            grp.getgrnam(g)
+            serial_group = g
+            break
+        except KeyError:
+            continue
+
+    if serial_group is None:
+        _ok("No dialout/uucp group found — serial access may work via udev rules")
+    else:
+        try:
+            members = grp.getgrnam(serial_group).gr_mem
+        except KeyError:
+            members = []
+        if user in members:
+            _ok(f"'{user}' is already in the {serial_group} group")
+        else:
+            _warn(f"'{user}' is not in the {serial_group} group — adding…")
+            result = subprocess.run(
+                ["sudo", "usermod", "-aG", serial_group, user],
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                _ok(f"Added to {serial_group} group")
+                needs_relogin = True
+            else:
+                _warn("Could not add automatically. Run manually:")
+                print(f"\n        sudo usermod -aG {serial_group} {user}\n")
+
+    if needs_relogin:
+        _warn("Group changes won't take effect until you start a new login session.")
+        _warn("To apply them NOW without logging out, run:")
+        print(f"\n        newgrp {serial_group or 'dialout'}\n")
+
+# ── Step 7: Daemon autostart ─────────────────────────────────────────────────
+
+def setup_autostart():
+    _step("Daemon autostart")
+
+    python = str(_venv_python())
+    daemon = str(PROJECT / "watch_daemon.py")
+
+    if _OS == "Linux":
+        _autostart_linux(python, daemon)
+    elif _OS == "Windows":
+        _autostart_windows(python, daemon)
+    else:
+        _warn(f"Autostart not implemented for {_OS} — start daemon manually")
+
+
+def _autostart_linux(python: str, daemon: str):
+    systemd_dir = Path.home() / ".config" / "systemd" / "user"
+    systemd_dir.mkdir(parents=True, exist_ok=True)
+    service = systemd_dir / "claude-watch.service"
+
+    service.write_text(
+        "[Unit]\n"
+        "Description=Claude Watch BLE daemon\n"
+        "After=bluetooth.target\n\n"
+        "[Service]\n"
+        f"ExecStart={python} {daemon}\n"
+        "Restart=always\n"
+        "RestartSec=5\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["systemctl", "--user", "daemon-reload"],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        _warn("systemctl not available — daemon won't auto-start on login")
+        _warn(f"Service file written to {service} for manual use")
+        return
+
+    subprocess.run(["systemctl", "--user", "enable", "claude-watch"],
+                   capture_output=True)
+    subprocess.run(["systemctl", "--user", "start",  "claude-watch"],
+                   capture_output=True)
+    _ok("Daemon enabled as systemd user service (claude-watch)")
+    _ok("Starts automatically on login, restarts on failure")
+
+
+def _autostart_windows(python: str, daemon: str):
+    # Register in HKCU Run key so it starts on login
+    ps = (
+        '$path = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"\n'
+        f'Set-ItemProperty -Path $path -Name "ClaudeWatchDaemon" '
+        f'-Value \'"{python}" "{daemon}"\'\n'
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        _ok("Daemon registered in Windows startup (HKCU Run)")
+    else:
+        _warn("Could not register startup entry — start daemon manually from GUI")
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -433,12 +629,16 @@ def main():
     create_launcher()
     create_shortcut()
     check_ble_permissions()
+    setup_autostart()
 
     print(f"\n{_GREEN}{_BOLD}✓ All done!{_RESET}\n")
     print("  Next steps:")
-    print("  1. Open ClaudeWatch from your desktop or app menu")
-    print("  2. Flash the watch: click ⚡ Flash Watch, select your serial port")
-    print("  3. Open a new Claude Code session — the watch connects automatically")
+    print("  1. Open ClaudeWatch (GUI) to flash the firmware onto the watch")
+    print("  2. The daemon starts automatically on login — or start it from the GUI")
+    print(f"  3. Start Claude Code {_BOLD}with bypass mode{_RESET} so the watch handles approvals:")
+    print(f"\n       {_CYAN}claude --dangerouslySkipPermissions{_RESET}\n")
+    print("     Claude will use ask_watch() for any destructive actions instead of")
+    print("     halting at a terminal permission prompt.")
     print()
 
 
