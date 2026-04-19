@@ -1,105 +1,107 @@
-# M5StickC Plus Gesture Wand
+# M5StickC Plus Claude Wand
 
-Control your laptop with wrist gestures over Bluetooth using an M5StickC Plus (the orange one).
+Wear the M5StickC Plus on your wrist while working with Claude Code. The watch shows what Claude is doing, buzzes when tasks finish, and lets you approve or reject actions with a button press — no keyboard required.
 
-The watch detects motion via its built-in IMU and sends gesture events to your laptop over BLE. A Python client receives them and injects real keypresses — works on Wayland.
+## What it does
 
-## Gestures
-
-| Gesture | Default action |
-|---|---|
-| Tilt left | Previous track |
-| Tilt right | Next track |
-| Tilt up | Volume up |
-| Tilt down | Volume down |
-| Shake | Play / pause |
-| Flick forward | → (next slide) |
-| Flick back | ← (prev slide) |
-| Rotate CW | Scroll down |
-| Rotate CCW | Scroll up |
-| Button A (big) | Space |
-| Button B (small) | Escape |
+- **Status display** — Claude pushes short status strings ("Reading files…", "Running tests…", "Done") to the watch display in real time
+- **Task notifications** — when Claude finishes something it buzzes the watch and flashes the LED
+- **Approvals** — Claude can ask a yes/no question on the watch before taking any irreversible action; you press BTN_A (yes) or BTN_B (no)
+- **Watch-to-Claude events** — gestures and button presses are queued and readable by Claude via `get_watch_events`
 
 ## Hardware
 
-- [M5StickC Plus](https://shop.m5stack.com/products/m5stickc-plus-esp32-pico-mini-iot-development-kit) — ESP32-PICO-D4 + MPU6886 IMU + BLE
+[M5StickC Plus](https://shop.m5stack.com/products/m5stickc-plus-esp32-pico-mini-iot-development-kit) — ESP32-PICO-D4, MPU6886 IMU, BLE 4.2, built-in buzzer and LED.
 
-## Setup
+## Quick start
 
-### 1 — Flash the firmware
-
-Install [arduino-cli](https://arduino.github.io/arduino-cli/), then:
+Requires Python 3.10+. Works on Windows 10/11, Ubuntu 20.04+, Fedora 36+, Arch.
 
 ```bash
-arduino-cli config add board_manager.additional_urls \
-  https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_index.json
-arduino-cli core update-index
-arduino-cli core install m5stack:esp32
-arduino-cli lib install "M5StickCPlus"
-./flash.sh
+python3 install.py
 ```
 
-The M5Stick screen shows **"Advertising..."** when ready.
+That's it. The installer:
+- Creates a Python venv and installs dependencies
+- Downloads `arduino-cli` if not already on PATH
+- Installs the M5Stack ESP32 core and M5StickCPlus library
+- Registers the MCP server with Claude Code
+- Creates `run_gui.sh` (or `run_gui.bat` on Windows)
 
-### 2 — Run the laptop client
+Then open the GUI to flash the watch and verify the connection:
 
 ```bash
-cd laptop
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cd ..
-./run.sh
+./run_gui.sh
 ```
 
-On Linux, add yourself to the `input` and `uucp` groups first (one-time):
+Click **⚡ Flash Watch**, select your serial port, and wait for it to finish. The watch shows **"Advertising…"** when ready.
+
+> **Note:** close the GUI before opening a Claude Code session — only one BLE client can connect at a time. Claude Code starts the MCP server automatically.
+
+### Skip arduino-cli setup
+
+If you already have `arduino-cli` on PATH:
 
 ```bash
-sudo usermod -aG input,uucp $USER
-newgrp input
+python3 install.py --no-arduino
 ```
 
-## Customising gestures
+## MCP tools
 
-Everything lives in [`laptop/gestures.py`](laptop/gestures.py) — it's the only file you need to touch.
+Once connected, Claude has access to these tools:
 
-**Change an action:**
-```python
-def on_shake(zone: str):
-    tap(e.KEY_MUTE)   # was KEY_PLAYPAUSE
-```
+| Tool | Description |
+|---|---|
+| `set_watch_status(status)` | Update the status line on the watch display |
+| `notify_watch(message)` | Buzz + LED flash + show message for 3 s |
+| `ask_watch(question, timeout_seconds)` | Block until BTN_A (yes) or BTN_B (no) |
+| `get_watch_events()` | Read pending gestures / button presses |
+| `watch_connected()` | Check if the watch is connected |
 
-**Add a new gesture:**
-1. Call `sendGesture("MY_GESTURE")` somewhere in the firmware
-2. Add a handler and map it in `gestures.py`:
-```python
-def on_my_gesture(zone: str):
-    tap(e.KEY_BRIGHTNESSUP)
+### Example Claude usage
 
-GESTURE_MAP = {
-    ...
-    "MY_GESTURE": on_my_gesture,
-}
-```
+You can tell Claude things like:
 
-## Proximity zones
+- *"Use the watch to notify me when the build finishes"*
+- *"Ask me on the watch before running any destructive command"*
+- *"Keep the watch updated with what you're doing"*
 
-The client gates gestures by RSSI so accidental triggers don't fire from across the room:
+Claude will call `ask_watch` before actions like `rm -rf`, `git push --force`, or dropping database tables, and will call `notify_watch` when long tasks complete.
 
-| Zone | RSSI | Behaviour |
+## Watch buttons & gestures
+
+| Input | IDLE state | ASKING state |
 |---|---|---|
-| NEAR | ≥ -65 dBm | Full gesture control |
-| MEDIUM | ≥ -80 dBm | Gestures active |
-| FAR | < -80 dBm | Gestures suppressed |
+| BTN_A (large) | Sends `BTN_A` event | Sends `APPROVE` → yes |
+| BTN_B (small) | Sends `BTN_B` event | Sends `REJECT` → no |
+| Shake | Sends `SHAKE` | — (ignored) |
+| Tilt up/down/left/right | Sends `TILT_*` | — (ignored) |
+| Flick / rotate | Sends `FLICK_*` / `ROTATE_*` | — (ignored) |
 
-Thresholds are at the top of `gestures.py`.
+Gestures are accessible via `get_watch_events()`.
 
-## Tuning sensitivity
+## BLE protocol
 
-All thresholds are `#define` constants at the top of `firmware/m5stick_gesture/m5stick_gesture.ino`:
+Two GATT characteristics on service `4fafc201-1fb5-459e-8fcc-c5c9c331914b`:
 
-```cpp
-#define TILT_ANGLE_THRESHOLD  28.0f   // degrees — lower = more sensitive
-#define SHAKE_ACCEL_THRESHOLD  2.2f   // g-force above 1g
-#define FLICK_GYRO_THRESHOLD  280.0f  // deg/s
+**Watch → Laptop** (notify, UUID `…26a8`): plain UTF-8 event strings (`APPROVE`, `REJECT`, `BTN_A`, `SHAKE`, `TILT_UP`, …)
+
+**Laptop → Watch** (write, UUID `…26a9`): single-character commands:
+
+| Command | Effect |
+|---|---|
+| `S:<text>` | Set status display |
+| `N:<text>` | Notification (buzz + LED + 3 s display) |
+| `A:<text>` | Ask yes/no (enters ASKING state) |
+| `B:<ms>` | Buzz for N milliseconds |
+| `C` | Clear / return to idle |
+
+## Flashing the old gesture-wand firmware
+
+The original gesture-to-keypress firmware is still available:
+
+```bash
+./flash.sh gesture
 ```
 
-Adjust and re-run `./flash.sh` to apply.
+See `firmware/m5stick_gesture/` and `laptop/` for that setup.

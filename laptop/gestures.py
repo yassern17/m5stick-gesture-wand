@@ -53,6 +53,8 @@ class ProximityInfo(NamedTuple):
     zone:       str    # one of the five zone names above
     distance_m: float  # estimated metres (one decimal place)
     rssi:       int    # smoothed RSSI in dBm
+    location:   str   = "unknown"  # nearest calibrated fingerprint label (see gui.py)
+    confidence: float = 0.0        # Euclidean dB distance to that fingerprint (lower = better)
 
 def estimate_distance(rssi: int) -> float:
     """Log-distance path loss model → metres."""
